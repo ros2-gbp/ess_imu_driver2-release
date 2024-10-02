@@ -27,8 +27,8 @@ find_package(sensor_msgs REQUIRED)
 # the user before building this ROS node
 
 # 1. Select NONE for standard PC, or RPI for RaspberryPi
-#set(PLATFORM "NONE")
-set(PLATFORM "RPI")
+set(PLATFORM "NONE")
+#set(PLATFORM "RPI")
 
 # 2. Select serial interface type UART or SPI
 set(INTERFACE "UART")
