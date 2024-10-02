@@ -1,16 +1,16 @@
 //==============================================================================
 //
 // 	epson_imu_uart_ros2_node.cpp
-//     - ROS node for Epson IMU sensor evaluation
+//     - ROS2 node for Epson IMU sensor evaluation
 //     - This program initializes the Epson IMU and publishes ROS messages in
 //       ROS topic /epson_imu as convention per [REP 145]
 //       (http://www.ros.org/reps/rep-0145.html).
-//     - If the IMU model supports quaternion output (currently supported only
-//       by G330/G365/G366) orientation fields are updated in published topic
-//       /epson_imu/data
-//     - If the IMU model does not support quaternion output (currently
-//       G320/G354/G364/G370/V340) orientation fields do not update in published
-//       topic /epson_imu/data_raw
+//     - If the IMU model supports quaternion output
+//       then sensor messages are published topic /epson_imu/data with
+//       angular_velocity, linear_acceleration, orientation fields updating
+//     - If the IMU model does not support quaternion output
+//       then sensor messages are published topic /epson_imu/data with only
+//       angular_velocity, and linear_acceleration fields updating
 //
 //  [This software is BSD-3
 //  licensed.](http://opensource.org/licenses/BSD-3-Clause)
@@ -19,7 +19,7 @@
 //  Copyright (c) 2019, Carnegie Mellon University. All rights reserved.
 //
 //  Additional Code contributed:
-//  Copyright (c) 2019, 2023, Seiko Epson Corp. All rights reserved.
+//  Copyright (c) 2019, 2024, Seiko Epson Corp. All rights reserved.
 //
 //  Redistribution and use in source and binary forms, with or without
 //  modification, are permitted provided that the following conditions are met:
@@ -52,7 +52,6 @@
 #include <chrono>
 #include <memory>
 
-#include <geometry_msgs/msg/quaternion.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/temperature.hpp>
@@ -64,34 +63,28 @@
 #include "hcl.h"
 #include "hcl_gpio.h"
 #include "hcl_uart.h"
+#include "sensor_epsonUart.h"
 #include "sensor_epsonCommon.h"
 
 //=========================================================================
 // Timestamp Correction
 //
-// This assumes that the ROS time is sync'ed to external 1PPS pulse sent to
-// Epson IMU GPIO2_EXT pin and the IMU External Reset Counter function is
-// enabled and ROS latency of calling rclcpp::Clock().now() is
-// less than 0.020 seconds. Otherwise the reset counter may overflow and the
-// timestamp correction will not be reliable. The IMU reset count returned
-// is already converted to nsecs units
+// Time correction makes use of the Epson IMU External Reset Counter function.
+// This assumes that the ROS time is accurately sync'ed to GNSS (approx.
+// within 100s of microsecs) and the GNSS 1PPS signal is sent to
+// Epson IMU's GPIO2_EXT pin. The system latency for calling
+// rclcpp::Clock().now() is assumed to be negligible. Otherwise the timestamp
+// correction may not be reliable. The get_stamp() method attempts to return
+// a timestamp based on the IMU reset count value to exclude time delays
+// caused by latencies in the link between the host system and the IMU.
 //=========================================================================
 
 class TimeCorrection {
  private:
-#if defined G320PDG0 || defined G354PDH0 || defined G364PDC0 || \
-    defined G364PDCA || defined V340PDD0
-  // Counter freq = 46875Hz, Max Count = 65535/46875 * 1e9
-  const int64_t MAX_COUNT = 1398080000;
-  const int64_t ALMOST_ROLLOVER = 1340000000;
-#else
-  // Counter freq = 62500Hz, Max Count = 65535/62500 * 1e9
-  const int64_t MAX_COUNT = 1048560000;
-  const int64_t ALMOST_ROLLOVER = 1010000000;
-#endif
   const int64_t ONE_SEC_NSEC = 1000000000;
   const int64_t HALF_SEC_NSEC = 500000000;
-
+  int64_t max_count;
+  int64_t almost_rollover;
   int64_t count_corrected;
   int64_t count_corrected_old;
   int64_t count_old;
@@ -101,13 +94,18 @@ class TimeCorrection {
   int64_t time_nsec_current;
   bool rollover;
   bool flag_imu_lead;
+  bool is_gen2_imu;
 
  public:
   TimeCorrection();
+  void set_imu(int);
   rclcpp::Time get_stamp(int);
 };
 
+// Constructor
 TimeCorrection::TimeCorrection() {
+  max_count = 1048560000;
+  almost_rollover = max_count * 0.95;
   count_corrected = 0;
   count_old = 0;
   count_diff = 0;
@@ -117,13 +115,32 @@ TimeCorrection::TimeCorrection() {
   count_corrected_old = 0;
   rollover = false;
   flag_imu_lead = false;
+  is_gen2_imu = false;
+}
+
+//=========================================================================
+// TimeCorrection::set_imu
+//
+// Sets the count thresholds based on external counter reset frequencies
+// which may vary depending on the Epson IMU model.
+//=========================================================================
+
+void TimeCorrection::set_imu(int epson_model) {
+  // max_count depends on IMU model's reset counter freq
+  // For Gen2 IMUs freq = 46875Hz, max_count = 65535/46875 * 1e9
+  // For Gen3 IMUs freq = 62500Hz, max_count = 65535/62500 * 1e9
+  is_gen2_imu = ((epson_model == G320PDG0) || (epson_model == G320PDGN) ||
+                 (epson_model == G354PDH0) || (epson_model == G364PDCA) ||
+                 (epson_model == G364PDC0));
+
+  max_count = (is_gen2_imu) ? 1398080000 : 1048560000;
 }
 
 //=========================================================================
 // TimeCorrection::get_stamp
 //
 // Returns the timestamp based on time offset from most recent 1PPS signal.
-// Epson IMU has a free-running upcounter that resets on active 1PPS signal.
+// Epson IMU has a free-running up-counter that resets on active 1PPS signal.
 // Counter value is embedded in the sensor data at the time of sampling.
 // Time stamp is corrected based on reset counter retrieved from embedded
 // sensor data.
@@ -133,15 +150,17 @@ rclcpp::Time TimeCorrection::get_stamp(int count) {
   rclcpp::Time now = rclcpp::Clock().now();
   time_sec_current = now.seconds();
   time_nsec_current = now.nanoseconds();
-  // std::cout.precision(20);
+
+  // almost_rollover is arbitrarily set at ~95% of max_count
+  almost_rollover = max_count * 0.95;
 
   count_diff = count - count_old;
-  if (count > ALMOST_ROLLOVER) {
+  if (count > almost_rollover) {
     rollover = true;
   }
   if (count_diff < 0) {
     if (rollover) {
-      count_diff = count + (MAX_COUNT - count_old);
+      count_diff = count + (max_count - count_old);
       std::cout << "Warning: time_correction enabled but IMU reset counter "
                    "rollover detected. If 1PPS not connected to IMU GPIO2/EXT "
                    "pin, disable time_correction."
@@ -177,8 +196,8 @@ rclcpp::Time TimeCorrection::get_stamp(int count) {
 //
 // 1. Retrieves node parameters from launch file otherwise uses defaults.
 // 2. Creates a publisher for IMU messages
-// 3. Sets up communication and initializes IMU
-// 4. Starts an internal timer to periodically check for incoming IMU burst data
+// 3. Sets up communication and initializes IMU with launch file settings
+// 4. Starts an internal timer to periodically check for incoming IMU data
 // 5. Formats and publishes IMU messages until <CTRL-C>
 //=========================================================================
 
@@ -187,17 +206,18 @@ using namespace std::chrono_literals;
 
 class ImuNode : public rclcpp::Node {
  public:
-  explicit ImuNode(const rclcpp::NodeOptions &op) : Node("epson_node", op) {
+  explicit ImuNode(const rclcpp::NodeOptions& op) : Node("epson_node", op) {
     ParseParams();
+    Init();
 
     // publisher
     imu_data_pub_ =
-        this->create_publisher<sensor_msgs::msg::Imu>(imu_topic_.c_str(), 10);
+      this->create_publisher<sensor_msgs::msg::Imu>(imu_topic_.c_str(), 10);
     imu_tempc_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>(
-        temperature_topic_.c_str(), 20);
-    Init();
-    // Poll to check for IMU burst read data @ 4000Hz
-    // (atleast 2x the highest output rate 2000Hz)
+      temperature_topic_.c_str(), 20);
+
+    // poll_rate_ must be at least 4000Hz (2x the highest IMU
+    // output rate of 2000Hz)
     std::chrono::milliseconds ms((int)(1000.0 / poll_rate_));
     timer_ = this->create_wall_timer(ms, std::bind(&ImuNode::Spin, this));
   }
@@ -215,6 +235,12 @@ class ImuNode : public rclcpp::Node {
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_data_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr imu_tempc_pub_;
 
+  char prod_id_[9];  // String to store Device Product ID
+  char ser_id_[9];   // String to store Device Serial ID
+
+  // IMU properties
+  struct EpsonProperties epson_sensor_;
+
   // IMU configuration settings
   struct EpsonOptions options_ = {};
 
@@ -227,50 +253,64 @@ class ImuNode : public rclcpp::Node {
   std::string temperature_topic_;
   double poll_rate_;
 
-  // time_correction function requires 1PPS connection to IMU GPIO2_EXT pin
-  // cannot be used with ext_trigger at the same time
+  // Flag for enable/disable time_correction function
+  // Time correction requires 1PPS connection to IMU GPIO2_EXT pin
+  // and cannot be used with ext_trigger at the same time
   bool time_correction_;
 
-  std::string prod_id_;
-  std::string serial_id_;
-
+  // Time correction object
   TimeCorrection tc;
 
-  // NOTE: It is recommended to change IMU settings by launch files instead of
-  //       modifying directly here in the source code
   void ParseParams() {
+    // NOTE: IMU settings are parsed when this node is launched using .py
+    //       launch file in launch/ folder
+    //       To change the IMU settings, it is recommended to modify
+    //       .py launch file instead of this source file
+
     std::string key;
+    // Defaults for IMU which can be changed by .py launch file
     port_ = "/dev/ttyUSB0";
     frame_id_ = "imu_link";
     imu_topic_ = "/epson_imu/data_raw";
     temperature_topic_ = "/epson_imu/tempc";
     poll_rate_ = 4000.0;
     time_correction_ = false;
-    // ext_trigger function requires external trigger signal to IMU GPIO2_EXT
-    // pin cannot be used with time_correction at the same time
+
+    // ext_trigger function should not be enabled when time correction enabled
     bool ext_trigger_en_ = false;
+
     bool output_32bit_ = false;
 
-    // Initialize defaults of IMU settings
-    options_.ext_sel =
-        0;  // 0 = Sample Counter 1=Reset Counter 2=External Trigger
+    // ext_sel 0 = Sample Counter 1=Reset Counter 2=External Trigger
+    options_.ext_sel = 1;
+
+    // drdy_pol 1 = active HIGH 0=active LOW
     options_.drdy_on = true;
-    options_.drdy_pol = 1;  // 1 = active HIGH 0=active LOW
+    options_.drdy_pol = 1;
+
     options_.dout_rate = CMD_RATE125;
     options_.filter_sel = CMD_FLTAP32;
     options_.flag_out = true;
+
+    // temp_out must be set true to publish temperature data
     options_.temp_out = true;
+
     options_.gyro_out = true;
     options_.accel_out = true;
-    options_.qtn_out =
-        false;  // Can be set true only for G365PDC1, G365PDF1, G325PDF1
-    options_.count_out = true;  // Must be enabled for time_correction function
+    options_.qtn_out = false;
+
+    // count_out must be set true for time_correction function
+    options_.count_out = true;
+
     options_.checksum_out = true;
-    options_.atti_mode =
-        1;  // 1=Euler mode 0=Inclination mode (Euler mode is typical)
-    options_.atti_profile =
-        0;  // Can only be nonzero only for G365PDC1, G365PDF1, G325PDF1
-            // 0=General 1=Vehicle 2=Construction Machinery
+
+    // atti_mode is only valid for attitude/quaternion output
+    // atti_mode 1=Euler mode 0=Inclination mode
+    options_.atti_mode = 1;
+
+    // atti_profile only is valid for attitude/quaternion output
+    // 0=General 1=Vehicle 2=Construction Machinery
+    options_.atti_profile = 0;
 
     // Read parameters
     key = "serial_port";
@@ -284,7 +324,7 @@ class ImuNode : public rclcpp::Node {
 
     key = "frame_id";
     if (this->get_parameter(key, frame_id_)) {
-      RCLCPP_INFO(this->get_logger(), "%s:\t\t%s", key.c_str(),
+      RCLCPP_INFO(this->get_logger(), "%s:\t\t\t%s", key.c_str(),
                   frame_id_.c_str());
     } else {
       RCLCPP_WARN(this->get_logger(),
@@ -301,15 +341,6 @@ class ImuNode : public rclcpp::Node {
                   time_correction_);
     }
 
-    key = "ext_trigger_en";
-    if (this->get_parameter(key, ext_trigger_en_)) {
-      RCLCPP_INFO(this->get_logger(), "%s:\t%d", key.c_str(), ext_trigger_en_);
-    } else {
-      RCLCPP_WARN(this->get_logger(),
-                  "Not specified param %s. Set default value:\t%d", key.c_str(),
-                  ext_trigger_en_);
-    }
-
     key = "burst_polling_rate";
     if (this->get_parameter(key, poll_rate_)) {
       RCLCPP_INFO(this->get_logger(), "%s:\t%.1f", key.c_str(), poll_rate_);
@@ -319,9 +350,28 @@ class ImuNode : public rclcpp::Node {
                   key.c_str(), poll_rate_);
     }
 
+    key = "temperature_topic";
+    if (this->get_parameter(key, temperature_topic_)) {
+      RCLCPP_INFO(this->get_logger(), "%s:\t\t%s", key.c_str(),
+                  temperature_topic_.c_str());
+    } else {
+      RCLCPP_WARN(this->get_logger(),
+                  "Not specified param %s. Set default value:\t%s", key.c_str(),
+                  temperature_topic_.c_str());
+    }
+
+    key = "ext_trigger_en";
+    if (this->get_parameter(key, ext_trigger_en_)) {
+      RCLCPP_INFO(this->get_logger(), "%s:\t%d", key.c_str(), ext_trigger_en_);
+    } else {
+      RCLCPP_WARN(this->get_logger(),
+                  "Not specified param %s. Set default value:\t%d", key.c_str(),
+                  ext_trigger_en_);
+    }
+
     key = "imu_dout_rate";
     if (this->get_parameter(key, options_.dout_rate)) {
-      RCLCPP_INFO(this->get_logger(), "%s:\t%d", key.c_str(),
+      RCLCPP_INFO(this->get_logger(), "%s:\t\t%d", key.c_str(),
                   options_.dout_rate);
     } else {
       RCLCPP_WARN(this->get_logger(),
@@ -331,7 +381,7 @@ class ImuNode : public rclcpp::Node {
 
     key = "imu_filter_sel";
     if (this->get_parameter(key, options_.filter_sel)) {
-      RCLCPP_INFO(this->get_logger(), "%s:\t%d", key.c_str(),
+      RCLCPP_INFO(this->get_logger(), "%s:\t\t%d", key.c_str(),
                   options_.filter_sel);
     } else {
       RCLCPP_WARN(this->get_logger(),
@@ -348,34 +398,9 @@ class ImuNode : public rclcpp::Node {
                   options_.qtn_out);
     }
 
-    // if quaternion is enabled then change topic to /imu/data
-    imu_topic_ = (static_cast<bool>(options_.qtn_out) == false)
-                     ? "/epson_imu/data_raw"
-                     : "/epson_imu/data";
-
-    key = "imu_topic";
-    if (this->get_parameter(key, imu_topic_)) {
-      RCLCPP_INFO(this->get_logger(), "%s:\t\t%s", key.c_str(),
-                  imu_topic_.c_str());
-    } else {
-      RCLCPP_WARN(this->get_logger(),
-                  "Not specified param %s. Set default value:\t%s", key.c_str(),
-                  imu_topic_.c_str());
-    }
-
-    key = "temperature_topic";
-    if (this->get_parameter(key, temperature_topic_)) {
-      RCLCPP_INFO(this->get_logger(), "%s:\t\t%s", key.c_str(),
-                  temperature_topic_.c_str());
-    } else {
-      RCLCPP_WARN(this->get_logger(),
-                  "Not specified param %s. Set default value:\t%s", key.c_str(),
-                  temperature_topic_.c_str());
-    }
-
     key = "output_32bit_en";
     if (this->get_parameter(key, output_32bit_)) {
-      RCLCPP_INFO(this->get_logger(), "%s:\t%d", key.c_str(), output_32bit_);
+      RCLCPP_INFO(this->get_logger(), "%s:\t\t%d", key.c_str(), output_32bit_);
     } else {
       RCLCPP_WARN(this->get_logger(),
                   "Not specified param %s. Set default value:\t%d", key.c_str(),
@@ -399,6 +424,7 @@ class ImuNode : public rclcpp::Node {
     }
 
     // Send warning if both time_correction & ext_trigger are enabled
+    // Disable ext_trigger if both are enabled
     if (time_correction_ && ext_trigger_en_) {
       RCLCPP_ERROR(this->get_logger(),
                    "Time correction & ext_trigger both enabled");
@@ -412,7 +438,9 @@ class ImuNode : public rclcpp::Node {
                   "Trigger should be connected to GPIO2/EXT");
     } else if (time_correction_ && !ext_trigger_en_) {
       options_.ext_sel = 1;
-      RCLCPP_INFO(this->get_logger(), "1PPS should be connected to GPIO2/EXT");
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Time correction enabled. 1PPS should be connected to GPIO2/EXT");
     }
   }
 
@@ -434,35 +462,35 @@ class ImuNode : public rclcpp::Node {
     }
 
     while (rclcpp::ok() && !(uartInit(port_.c_str(), BAUD_460800))) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Retry to open port: %s in 1 second period...",
-                  port_.c_str());
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Retry to initialize the UART interface: %s in 1 second period...",
+        port_.c_str());
       one_sec.sleep();
     }
 
-    while (rclcpp::ok() && !InitImu(options_)) {
+    while (rclcpp::ok() && !InitImu(&epson_sensor_, &options_)) {
       RCLCPP_WARN(this->get_logger(), "Retry to initialize the IMU...");
       one_sec.sleep();
     }
 
-    IdentifyBuild();
-    IdentifyDevice();
-    int result = get_prod_id().compare(BUILD_FOR);
-    if (result == 0) {
-      RCLCPP_INFO(this->get_logger(), "OK: Build matches detected device");
-    } else {
-      RCLCPP_ERROR(this->get_logger(),
-                   "*** Build *mismatch* with detected device ***");
-      RCLCPP_WARN(
-          this->get_logger(),
-          "*** Check the CMakeLists.txt for setting a compatible IMU_MODEL "
-          "variable, modify as necessary, and rebuild the driver ***");
+    // Initialize time correction thresholds if enabled
+    if (time_correction_) {
+      tc.set_imu(epson_sensor_.model);
     }
+
+    // if quaternion output is enabled set topic to /epson_imu/data
+    // Otherwise set topic to /epson_imu/data_raw
+    imu_topic_ = (static_cast<bool>(options_.qtn_out) == false)
+                   ? "/epson_imu/data_raw"
+                   : "/epson_imu/data";
+
     sensorStart();
     RCLCPP_INFO(this->get_logger(), "Sensor started...");
   }
 
-  bool InitImu(const struct EpsonOptions &options_) {
+  bool InitImu(struct EpsonProperties* ptr_epson_sensor_,
+               struct EpsonOptions* ptr_options_) {
     RCLCPP_INFO(this->get_logger(), "Checking sensor power on status...");
     if (!sensorPowerOn()) {
       RCLCPP_WARN(this->get_logger(),
@@ -470,8 +498,16 @@ class ImuNode : public rclcpp::Node {
       return false;
     }
 
+    // Auto-detect Epson Sensor Model Properties
+    RCLCPP_INFO(this->get_logger(), "Detecting sensor model...");
+    if (!sensorGetDeviceModel(ptr_epson_sensor_, prod_id_, ser_id_)) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Error: failed to detect sensor model. Exiting...");
+      return false;
+    }
+
     RCLCPP_INFO(this->get_logger(), "Initializing Sensor...");
-    if (!sensorInitOptions(options_)) {
+    if (!sensorInitOptions(ptr_epson_sensor_, ptr_options_)) {
       RCLCPP_WARN(this->get_logger(),
                   "Error: could not initialize Epson Sensor. Exiting...");
       return false;
@@ -479,50 +515,6 @@ class ImuNode : public rclcpp::Node {
 
     RCLCPP_INFO(this->get_logger(), "Epson IMU initialized.");
     return true;
-  }
-
-  std::string get_prod_id() {
-    unsigned short prod_id1 = registerRead16(CMD_WINDOW1, ADDR_PROD_ID1, false);
-    unsigned short prod_id2 = registerRead16(CMD_WINDOW1, ADDR_PROD_ID2, false);
-    unsigned short prod_id3 = registerRead16(CMD_WINDOW1, ADDR_PROD_ID3, false);
-    unsigned short prod_id4 = registerRead16(CMD_WINDOW1, ADDR_PROD_ID4, false);
-
-    char myarray[] = {
-        static_cast<char>(prod_id1), static_cast<char>(prod_id1 >> 8),
-        static_cast<char>(prod_id2), static_cast<char>(prod_id2 >> 8),
-        static_cast<char>(prod_id3), static_cast<char>(prod_id3 >> 8),
-        static_cast<char>(prod_id4), static_cast<char>(prod_id4 >> 8)};
-    std::string prod_id(myarray);
-    return prod_id;
-  }
-
-  std::string get_serial_id() {
-    unsigned short ser_num1 =
-        registerRead16(CMD_WINDOW1, ADDR_SERIAL_NUM1, false);
-    unsigned short ser_num2 =
-        registerRead16(CMD_WINDOW1, ADDR_SERIAL_NUM2, false);
-    unsigned short ser_num3 =
-        registerRead16(CMD_WINDOW1, ADDR_SERIAL_NUM3, false);
-    unsigned short ser_num4 =
-        registerRead16(CMD_WINDOW1, ADDR_SERIAL_NUM4, false);
-
-    char myarray[] = {
-        static_cast<char>(ser_num1), static_cast<char>(ser_num1 >> 8),
-        static_cast<char>(ser_num2), static_cast<char>(ser_num2 >> 8),
-        static_cast<char>(ser_num3), static_cast<char>(ser_num3 >> 8),
-        static_cast<char>(ser_num4), static_cast<char>(ser_num4 >> 8)};
-    std::string ser_num(myarray);
-    return ser_num;
-  }
-
-  void IdentifyBuild() {
-    RCLCPP_INFO(this->get_logger(), "Compiled for:\t%s", BUILD_FOR);
-  }
-
-  void IdentifyDevice() {
-    RCLCPP_INFO(this->get_logger(), "Reading device info...");
-    RCLCPP_INFO(this->get_logger(), "PRODUCT ID:\t%s", get_prod_id().c_str());
-    RCLCPP_INFO(this->get_logger(), "SERIAL ID:\t%s", get_serial_id().c_str());
   }
 
   void PubImuData() {
@@ -538,9 +530,10 @@ class ImuNode : public rclcpp::Node {
     imu_msg->header.frame_id = frame_id_;
 
     while (rclcpp::ok()) {
-      // Call to read and post process IMU stream
+      // Call to read and post process IMU sensor burst data
       // Will return 0 if data incomplete or checksum error
-      if (sensorDataReadBurstNOptions(options_, &epson_data_)) {
+      if (sensorDataReadBurstNOptions(&epson_sensor_, &options_,
+                                      &epson_data_)) {
         if (!time_correction_) {
           imu_msg->header.stamp = this->now();
         } else {
@@ -573,9 +566,9 @@ class ImuNode : public rclcpp::Node {
 
       } else {
         RCLCPP_WARN(
-            this->get_logger(),
-            "Warning: Checksum error or incorrect delimiter bytes in imu_msg "
-            "detected");
+          this->get_logger(),
+          "Warning: Checksum error or incorrect delimiter bytes in imu_msg "
+          "detected");
       }
     }
   }
@@ -583,7 +576,7 @@ class ImuNode : public rclcpp::Node {
   void Spin() { PubImuData(); }
 };  // end of class
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
 
   // Force flush of the stdout buffer, which ensures a sync of all console
