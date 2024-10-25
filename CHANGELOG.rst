@@ -2,6 +2,10 @@
 Changelog for package ess_imu_driver2
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+2.0.2 (2024-10-25)
+------------------
+* Add changes stating support for Jazzy
+
 2.0.1 (2024-10-01)
 ------------------
 * Update CMakeLists.txt - set macro PLATFORM to NONE
