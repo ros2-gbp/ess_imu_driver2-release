@@ -1,0 +1,12 @@
+Source: ros-humble-ess-imu-driver2
+Section: misc
+Priority: optional
+Maintainer: Raymond Chow <raymond.chow@ea.epson.com>
+Build-Depends: debhelper (>= 9.0.0), ros-humble-ament-cmake, ros-humble-ament-lint-auto <!nocheck>, ros-humble-ament-lint-common <!nocheck>, ros-humble-rclcpp, ros-humble-sensor-msgs, ros-humble-ros-workspace
+Homepage: https://wiki.ros.org/ess_imu_driver2
+Standards-Version: 3.9.2
+
+Package: ros-humble-ess-imu-driver2
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-humble-rclcpp, ros-humble-sensor-msgs, ros-humble-ros-workspace
+Description: ROS2 package for Epson IMU using C++ wrapper around Linux C driver
