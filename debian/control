@@ -1,0 +1,12 @@
+Source: ros-jazzy-ess-imu-driver2
+Section: misc
+Priority: optional
+Maintainer: Raymond Chow <raymond.chow@ea.epson.com>
+Build-Depends: debhelper (>= 9.0.0), ros-jazzy-ament-cmake, ros-jazzy-ament-lint-auto <!nocheck>, ros-jazzy-ament-lint-common <!nocheck>, ros-jazzy-rclcpp, ros-jazzy-sensor-msgs, ros-jazzy-ros-workspace
+Homepage: https://wiki.ros.org/ess_imu_driver2
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-ess-imu-driver2
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-jazzy-rclcpp, ros-jazzy-sensor-msgs, ros-jazzy-ros-workspace
+Description: ROS2 package for Epson IMU using C++ wrapper around Linux C driver
